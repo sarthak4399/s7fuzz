@@ -2,9 +2,9 @@
 import socket
 import random
 import time
+import os
 from enum import Enum
-from scapy.all import Raw, TCP
-from scapy.contrib.s7comm import S7Header, S7Communication, S7WriteVarParameterReq
+from scapy.all import Raw, TPKT, COTP_CR, COTP_DT, S7, S7SetupCommunication, S7Header, S7Parameter, S7WriteVarRequest
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress
@@ -24,7 +24,7 @@ class S7FuzzerCLI:
         self.target = ""
         self.port = 102
         self.fuzz_type = FuzzType.ALL
-        self.iterations = 1000
+        self.iterations = 100
         self.running = False
         self.socket = None
         self.crash_count = 0
@@ -33,7 +33,7 @@ class S7FuzzerCLI:
         self.layout.split(
             Layout(name="header", size=3),
             Layout(name="main", ratio=1),
-            Layout(name="footer", size=3)
+            Layout(name="footer", size=5)
         )
         
     def _show_header(self):
@@ -62,7 +62,7 @@ class S7FuzzerCLI:
         status.add_column("Parameter", style="bold green")
         status.add_column("Value", style="yellow")
         
-        status.add_row("Target:", self.target)
+        status.add_row("Target:", self.target or "Not set")
         status.add_row("Port:", str(self.port))
         status.add_row("Fuzz Type:", self.fuzz_type.value)
         status.add_row("Iterations:", str(self.iterations))
@@ -76,10 +76,14 @@ class S7FuzzerCLI:
         console.clear()
         
     def _get_target(self):
-        self.target = Prompt.ask("Enter target IP address", default=self.target)
+        self.target = Prompt.ask("Enter target IP address", default=self.target or "192.168.1.100")
         
     def _get_port(self):
-        self.port = int(Prompt.ask("Enter port number", default=str(self.port)))
+        try:
+            self.port = int(Prompt.ask("Enter port number", default=str(self.port)))
+        except ValueError:
+            console.print("[bold red]Invalid port number, using default (102)[/]")
+            self.port = 102
         
     def _get_fuzz_type(self):
         choice = Prompt.ask(
@@ -90,28 +94,53 @@ class S7FuzzerCLI:
         self.fuzz_type = FuzzType(choice)
         
     def _get_iterations(self):
-        self.iterations = int(Prompt.ask(
-            "Number of iterations",
-            default=str(self.iterations)
-        ))
+        try:
+            self.iterations = int(Prompt.ask(
+                "Number of iterations",
+                default=str(self.iterations)
+            ))
+        except ValueError:
+            console.print("[bold red]Invalid number, using default (100)[/]")
+            self.iterations = 100
         
     def connect(self):
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(2)
             self.socket.connect((self.target, self.port))
+            
+            # Send COTP Connection Request
+            cotp_cr = TPKT()/COTP_CR()
+            self.socket.send(bytes(cotp_cr))
+            response = self.socket.recv(1024)
+            if not response:
+                console.print("[bold red]COTP connection failed: No response[/]")
+                return False
+            
+            # Send S7 Setup Communication
+            s7_setup = TPKT()/COTP_DT()/S7()/S7SetupCommunication()
+            self.socket.send(bytes(s7_setup))
+            response = self.socket.recv(1024)
+            if not response:
+                console.print("[bold red]S7 setup failed: No response[/]")
+                return False
+                
             return True
         except Exception as e:
             console.print(f"[bold red]Connection failed: {e}[/]")
             return False
         
     def fuzz(self):
+        if not self.target:
+            console.print("[bold red]Target IP address not set![/]")
+            return
+            
         if not self.connect():
             return
             
-        base_pkt = S7Header()/S7Communication()/S7WriteVarParameterReq(
+        base_pkt = TPKT()/COTP_DT()/S7()/S7Header()/S7WriteVarRequest(
             Items=[
-                {"VariableSpecification": 0x12, "Length": 0x0a00}
+                {"VariableSpecification": 0x12, "Length": 0x04, "SyntaxID": 0x10}
             ]
         )
         
@@ -123,14 +152,14 @@ class S7FuzzerCLI:
                     break
                     
                 try:
-                    # Fuzzing logic here
-                    if self.fuzz_type == FuzzType.FUNCTION:
-                        mutated = base_pkt.copy()
-                        mutated[S7Header].function = random.randint(0, 255)
-                    elif self.fuzz_type == FuzzType.DATA:
-                        mutated = base_pkt.copy()
-                        mutated[Raw].load = os.urandom(random.randint(1, 128))
-                        
+                    mutated = base_pkt.copy()
+                    
+                    if self.fuzz_type in [FuzzType.FUNCTION, FuzzType.ALL]:
+                        mutated[S7Header].FunctionCode = random.randint(0, 255)
+                    if self.fuzz_type in [FuzzType.DATA, FuzzType.ALL]:
+                        mutated[S7WriteVarRequest].Items[0].Length = random.randint(1, 128)
+                        mutated[Raw].load = os.urandom(mutated[S7WriteVarRequest].Items[0].Length)
+                    
                     self.socket.send(bytes(mutated))
                     response = self.socket.recv(1024)
                     
@@ -138,6 +167,8 @@ class S7FuzzerCLI:
                         self.crash_count += 1
                         console.print(f"[bold red]Potential crash at iteration {i}![/]")
                         
+                    time.sleep(0.1)  # Small delay to avoid overwhelming target
+                    
                 except Exception as e:
                     self.crash_count += 1
                     console.print(f"[bold red]Error at iteration {i}: {e}[/]")
@@ -145,6 +176,7 @@ class S7FuzzerCLI:
                 progress.update(task, advance=1)
                 
         self.socket.close()
+        self.socket = None
         
     def run(self):
         self.running = True
